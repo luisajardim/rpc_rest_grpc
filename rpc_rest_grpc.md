@@ -959,3 +959,208 @@ Responda individualmente, com suas próprias palavras. Cada resposta deve ter no
 - GOOGLE LLC. *gRPC — Core Concepts, Architecture and Lifecycle*. Disponível em: <https://grpc.io/docs/what-is-grpc/core-concepts/>.
 - MARTIN, Robert C. *Arquitetura Limpa: o guia do artesão para estrutura e design de software*. Alta Books, 2019. Cap. 18 (Boundary Anatomy) — padrões de fronteira entre componentes.
 - PYTHON SOFTWARE FOUNDATION. *xmlrpc — XMLRPC server and client modules*. Disponível em: <https://docs.python.org/3/library/xmlrpc.html>.
+
+---
+
+## Material de Estudo Opcional — Respostas Comentadas
+
+> Gabaritos de referência para as questões de reflexão de cada tarefa. Use para conferir seu raciocínio após responder por conta própria.
+
+### Tarefa 1 — XML-RPC
+
+**Q1 — Onde ocorre a serialização XML?**
+
+A serialização acontece dentro do `ServerProxy`, que é o stub do cliente. Quando o código chama `proxy.calcular("soma", 10, 3)`, o `ServerProxy` converte essa chamada num documento XML com a tag `<methodCall>` e manda via POST HTTP pro servidor. No servidor, o `SimpleXMLRPCServer` desserializa esse XML (unmarshalling) e só aí chama a função `calcular` de verdade. Ativando `logRequests=True` dá pra ver esse XML trafegando — o programador nunca escreve isso na mão, os stubs fazem tudo automaticamente.
+
+**Q2 — O que é `xmlrpc.client.Fault`?**
+
+É a forma que o XML-RPC tem de mandar um erro do servidor pro cliente pela rede. Ao chamar `proxy.calcular("raiz_quadrada", 9.0, 0.0)`, o servidor lança um `ValueError`, mas esse erro não pode "pular" direto pro cliente como faria num programa normal, porque os dois são processos separados e não compartilham memória. O servidor serializa o erro num XML com `<fault>` (contendo código e mensagem), manda pela rede, e o cliente recebe e relança como `xmlrpc.client.Fault`. É basicamente um `try/except` que atravessa a rede.
+
+**Q3 — `system.listMethods()` e transparência ISO/RM-ODP**
+
+Esse recurso se encaixa na **transparência de acesso**, que é quando o cliente consegue interagir com o servidor usando a mesma sintaxe que usaria pra chamar algo local. Com `proxy.system.listMethods()` é possível descobrir todos os métodos disponíveis no servidor — retorna uma lista Python normal como `['calcular', 'listar_operacoes', 'registrar_evento', ...]` — sem precisar consultar nenhuma documentação externa. Por trás, uma requisição XML-RPC completa foi feita, mas do ponto de vista do código parece só uma chamada de função local. Isso ilustra bem o que a ISO/RM-ODP chama de transparência de acesso: a complexidade do acesso remoto fica completamente escondida.
+
+
+
+---
+
+### Tarefa 2 — Stub Manual
+
+**Output obtido na execução:**
+
+```
+  [Skeleton] Servidor ouvindo em localhost:9876
+=======================================================
+  DEMONSTRACAO: Stub + Skeleton RPC manual via sockets
+=======================================================
+
+Chamada 1: somar(7, 5)
+  [Stub]     Enviando: {"method": "somar", "args": [7, 5]}
+  [Skeleton] Recebeu chamada: somar([7, 5])
+  Resultado recebido: 12
+
+Chamada 2: obter_info()
+  [Stub]     Enviando: {"method": "obter_info", "args": []}
+  [Skeleton] Recebeu chamada: obter_info([])
+  Resultado recebido: {'servico': 'calculadora', 'versao': '1.0', 'status': 'online'}
+
+Chamada 3: metodo inexistente (erro esperado)
+  [Stub]     Enviando: {"method": "metodo_que_nao_existe", "args": []}
+  [Skeleton] Recebeu chamada: metodo_que_nao_existe([])
+  Erro propagado corretamente: Erro remoto: "Metodo 'metodo_que_nao_existe' nao registrado"
+
+Servidor encerrado.
+```
+
+**Q1 — As quatro etapas do ciclo RPC (Birrell & Nelson, 1984)**
+
+No código dá pra mapear cada etapa com precisão. O **marshalling** acontece no stub, na linha `payload = json.dumps({"method": nome, "args": args}).encode()` — ali os argumentos Python viram bytes JSON pra poder viajar pela rede. A **transmissão** é o `s.sendall(len(payload).to_bytes(4, "big") + payload)`, que empurra esses bytes pelo socket TCP. O **dispatching** fica no skeleton, na linha `resultado = registro[nome](*args)` — o servidor recebeu o nome do método, achou ele no dicionário `REGISTRO` e chamou a função real. Por fim, o **unmarshalling** é o `resposta = json.loads(s.recv(tamanho).decode())` no stub, que converte os bytes da resposta de volta pra objeto Python. Cada etapa que o Birrell e Nelson descreveram em 1984 aparece explicitamente aqui — o que qualquer framework como XML-RPC ou gRPC faz é exatamente isso, só que escondido atrás dos stubs gerados.
+
+**Q2 — JSON vs Protobuf: consequência para alto volume de chamadas**
+
+A diferença prática é bem relevante pra sistemas com alto throughput. JSON é texto — serializar `{"method": "somar", "args": [7, 5]}` produz 31 bytes de string legível, com overhead de aspas, chaves e vírgulas. Protobuf é binário e usa field tags numéricos, então o equivalente ocupa bem menos bytes (às vezes 3-5× menor). Além do tamanho, o parsing de JSON exige converter texto pra estrutura (tokenização + alocação), enquanto o Protobuf é desempacotado direto da memória. Em poucas chamadas isso não aparece, mas num sistema com milhares de RPCs por segundo — tipo microserviços internos do Google — a diferença de CPU e banda é significativa. JSON ganhou aqui por legibilidade humana (dá pra ler o que trafega no log: `{"method": "somar", "args": [7, 5]}`), o que faz sentido pra um laboratório de análise, mas não seria a escolha pra produção de alto volume.
+
+**Q3 — Framing e a propriedade stream do TCP**
+
+O TCP é um protocolo de **stream de bytes**: ele garante que os bytes chegam na ordem certa e sem perda, mas não garante que chegam em "pacotes" com os mesmos limites de quando foram enviados. Se você mandar `s.sendall(payload)` sem framing, o receptor não tem como saber onde uma mensagem termina e outra começa — o `recv(1024)` pode receber metade de uma mensagem, ou uma mensagem e meia, dependendo de fragmentação, buffering do SO e latência de rede. O framing resolve isso colocando 4 bytes de tamanho antes do payload: o receptor lê os 4 bytes primeiro (`conn.recv(4)`), sabe quantos bytes vai receber, e só então faz o `conn.recv(tamanho)` lendo exatamente a mensagem completa. Sem isso, a desserialização JSON quebraria com dados incompletos ou embaralhados — exatamente o tipo de bug que aparece só em produção, com carga real.
+
+
+---
+
+### Tarefa 3 — API REST com Flask
+
+**Output obtido na execução:**
+
+```
+──────────────────────────────────────────────────
+  GET /produtos — listar todos
+──────────────────────────────────────────────────
+  Status: 200
+  Body:   [{"estoque": 15, "id": 1, "nome": "Teclado Mecanico", "preco": 349.9},
+            {"estoque": 8,  "id": 2, "nome": "Monitor 24pol",   "preco": 1299.0}]
+
+  GET /produtos/1 — buscar por ID   → Status: 200  (Teclado Mecanico)
+  GET /produtos/999 — inexistente   → Status: 404  {"erro": "Produto nao encontrado"}
+  POST /produtos — criar Headset USB → Status: 201  {"id": 3, "preco": 199.9, ...}
+  PUT  /produtos/3 — atualizar preco → Status: 200  {"preco": 179.9, ...}
+  DELETE /produtos/3                 → Status: 200  {"mensagem": "Produto 'Headset USB' removido"}
+  GET  /produtos/3 após DELETE       → Status: 404  (confirma remoção)
+  POST com dados inválidos           → Status: 400  {"erro": "Campos obrigatorios: nome, preco"}
+```
+
+**Q1 — Por que `201 Created` em vez de `200 OK` importa?**
+
+O código de status HTTP não é só um número de cortesia — ele carrega semântica que qualquer agente HTTP entende, sem precisar ler o corpo da resposta. O `201 Created` diz especificamente que um novo recurso foi criado como resultado da requisição, e convencionalmente vem acompanhado do header `Location` com a URI do novo recurso. Um proxy de cache, por exemplo, sabe que `201` significa que o estado do servidor mudou, então não deve reutilizar respostas cacheadas de `GET /produtos` — elas estão desatualizadas. Já um `200 OK` num `POST` seria ambíguo: foi uma leitura? Uma ação? Essa distinção é exatamente o que Fielding chama de interface uniforme — os verbos e os status comunicam intenção de forma padronizada, independente do que está no corpo JSON.
+
+**Q2 — O que precisaria mudar para o servidor ser genuinamente stateless?**
+
+O `_produtos` em memória é o problema: o servidor guarda estado entre requisições, o que viola a restrição de stateless do REST conforme Fielding (2000). Pra ser genuinamente stateless, o estado de sessão/aplicação precisa ser movido pra um armazenamento externo — um banco de dados (PostgreSQL, SQLite) ou um cache distribuído (Redis). A ideia é que qualquer instância do servidor consiga processar qualquer requisição olhando só pro banco, sem depender de nada que ficou na memória de uma requisição anterior. Com isso, também ganha escalabilidade horizontal: dá pra subir N instâncias do `servidor_rest.py` atrás de um load balancer, e todas servem corretamente porque o estado está no banco, não no processo.
+
+**Q3 — `proxy.calcular("soma", 7, 3)` vs `requests.post("/calculos", json={...})`: qual deixa o contrato mais claro?**
+
+Depende do ponto de vista. O RPC (`proxy.calcular(...)`) tem um contrato mais explícito sobre **o que fazer**: o nome da operação está no código, os tipos dos argumentos são definidos na interface, e um erro de assinatura aparece cedo. Já o REST (`requests.post("/calculos", json={...})`) tem um contrato mais explícito sobre **o recurso e a ação HTTP**: qualquer desenvolvedor que conheça HTTP sabe que `POST` cria algo em `/calculos`, sem precisar ler a documentação do servidor específico. A interface uniforme do REST é justamente isso — os verbos `GET/POST/PUT/DELETE` têm semântica universal, então o contrato é parcialmente comunicado pelo próprio protocolo. No RPC, você precisa consultar a documentação do servidor pra saber o que `calcular` aceita e retorna; no REST, você já sabe que `DELETE /produtos/3` remove o produto 3, só de ver a URI e o verbo.
+
+
+---
+
+### Tarefa 4 — gRPC
+
+**Output obtido na execução:**
+
+```
+=== Chamadas gRPC para o servico Calculadora ===
+
+  Status: online | Versao: 1.0.0
+
+  10.0 soma 3.0 = 13.0
+  10.0 subtracao 3.0 = 7.0
+  4.0 multiplicacao 7.0 = 28.0
+  22.0 divisao 7.0 = 3.142857142857143
+
+  Testando divisao por zero:
+  Erro capturado: [StatusCode.INVALID_ARGUMENT] Divisao por zero nao e permitida
+
+  Testando operacao invalida ('raiz_quadrada'):
+  Erro capturado: [StatusCode.INVALID_ARGUMENT] Operacao desconhecida: 'raiz_quadrada'
+```
+
+**Q1 — Contrato explícito (`.proto`) vs convenção implícita (REST)**
+
+A diferença prática é enorme em projetos com várias equipes. Com o `.proto`, o contrato é um arquivo versionável que o compilador valida: se o servidor mudar o campo `resultado` de `double` para `string` e regenerar os stubs, o cliente antigo vai falhar na compilação ou receber um valor que não é o tipo esperado — o erro aparece cedo, antes de chegar em produção. No REST sem schema, essa mesma mudança seria silenciosa: o servidor passa a retornar `"resultado": "13.0"` (string) e o cliente que esperava um número vai quebrar só em runtime, quando tentar fazer uma conta com o valor. O Protobuf usa field numbers (os `= 1`, `= 2` no `.proto`) pra serialização, então campos novos adicionados com números novos são simplesmente ignorados por clientes antigos — isso é compatibilidade retroativa por design. No REST, a convenção é documentar via OpenAPI/Swagger, mas nada impede o servidor de mudar sem avisar.
+
+**Q2 — `grpc.StatusCode.INVALID_ARGUMENT` vs HTTP `400`: qual é mais rico?**
+
+Os dois comunicam "entrada inválida", mas o `grpc.StatusCode` é mais rico semanticamente porque é um enum com ~17 códigos específicos — `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`, `PERMISSION_DENIED`, `UNAVAILABLE`, `DEADLINE_EXCEEDED`, cada um com significado preciso que qualquer cliente gRPC entende sem consultar documentação. O HTTP `400 Bad Request` é genérico demais: cobre desde JSON malformado até campos faltando até valores fora do range — a distinção real fica no corpo JSON, que é convenção, não protocolo. Na prática, vendo `StatusCode.INVALID_ARGUMENT` o cliente sabe que o problema está nos dados que ele mandou; vendo `StatusCode.UNAVAILABLE` sabe que é o servidor que está fora. Ambos não são equivalentes: o gRPC tem um vocabulário de erros padronizado embutido no protocolo, o REST delega isso pra aplicação.
+
+**Q3 — `xmlrpc.client.Fault` vs `grpc.RpcError`: qual oferece mais informação?**
+
+O `grpc.RpcError` é mais estruturado. O `Fault` do XML-RPC carrega dois campos: `faultCode` (inteiro) e `faultString` (texto livre) — vindo do servidor, foi serializado num XML `<fault>`. O `grpc.RpcError` carrega um `StatusCode` (enum padronizado pelo protocolo gRPC, compartilhado entre todas as linguagens), uma `details()` (mensagem textual) e opcionalmente metadados de trailing — além de ser propagado via HTTP/2 com headers de status. O ponto crítico é o `StatusCode`: como é um enum de protocolo, um cliente Python, Go ou Java recebe exatamente o mesmo código e pode tomar decisões programáticas sem parsear texto. O `faultCode` do XML-RPC é definido pela aplicação (sem padrão universal), então dois servidores diferentes podem usar o código `42` com significados completamente diferentes. O `grpc.RpcError` tem mais informação estruturada e intercambiável entre implementações.
+
+
+---
+
+### Tarefa 5 — Comparativo entre Paradigmas
+
+**Output obtido na execução:**
+
+```
+============================================================
+  COMPARATIVO: RPC  vs  REST  vs  gRPC
+============================================================
+
+[1] RPC — chamada procedural (estilo XML-RPC)
+    cliente.soma(7, 3) = 10
+    -> O cliente chama como funcao local; protocolo e invisible
+
+[2] REST — recurso + verbo HTTP
+    POST /calculos  -> 201  {'id': 1, 'operacao': 'soma', 'a': 7, 'b': 3, 'resultado': 10}
+    GET  /calculos/1  -> 200  {'id': 1, 'operacao': 'soma', 'a': 7, 'b': 3, 'resultado': 10}
+    -> Estado persistido como recurso; cliente controla via verbos
+
+[3] gRPC — contrato .proto + tipos fortes
+    Calcular(RequisicaoCalculo(operacao='soma', a=7, b=3))
+    -> 7.0 soma 3.0 = 10.0
+    -> Contrato em .proto; tipos verificados em compilacao
+
+  Dimensao           RPC (XML-RPC)      REST                 gRPC
+  Unidade central    Procedimento       Recurso (URI)        Servico (.proto)
+  Protocolo          HTTP ou TCP        HTTP/1.1             HTTP/2
+  Serializacao       XML                JSON (texto)         Protobuf (binario)
+  Contrato           Interface remota   Convencao REST       Schema .proto
+  Tipagem            Dinamica           Sem verificacao      Estatica / forte
+  Streaming          Nao nativo         Limitado             Sim (bidirecional)
+  Melhor para        Sistemas legados   APIs publicas/web    Microservicos internos
+```
+
+**Q1 — Tipagem forte do `.proto`: vantagem interna, barreira externa**
+
+Em microserviços internos, todas as equipes são da mesma organização, usam o mesmo repositório de `.proto` e têm controle sobre quando atualizar os stubs. A tipagem forte é uma vantagem porque o compilador detecta incompatibilidades antes do deploy — se o serviço de pagamento mudar a assinatura do `Calcular`, o serviço de pedidos que depende dele vai falhar na compilação, não em produção. Já pra APIs públicas consumidas por desenvolvedores externos — apps mobile, parceiros, startups de terceiros — exigir que cada consumidor compile um `.proto` e gere stubs na sua linguagem é uma barreira de adoção: o desenvolvedor precisa instalar `protoc`, lidar com versões do compilador, integrar ao seu build system. O JSON do REST, por outro lado, qualquer linguagem lê nativamente com uma linha de código. A tipagem forte protege times que colaboram no mesmo codebase; em público, ela cria fricção onde você quer zero fricção.
+
+**Q2 — "Orientado a recursos" vs "orientado a ações": cancelar um pedido**
+
+No RPC, a operação seria algo como `proxy.cancelar_pedido(pedido_id=42, motivo="fora de estoque")` — o foco é na **ação** (cancelar), o nome do método comunica a intenção diretamente. No REST, seria `PUT /pedidos/42` com body `{"status": "cancelado", "motivo": "fora de estoque"}` — o foco é no **recurso** (o pedido 42) e na transição de estado via verbo HTTP. A implicação prática é que o REST força a pensar em termos de recursos e seus estados (`rascunho → confirmado → cancelado`), o que se alinha naturalmente com bancos de dados e facilita caching (`GET /pedidos/42` pode ser cacheado por proxies). O RPC é mais natural pra operações que não mapeiam bem pra CRUD — como `calcular_frete`, `enviar_notificacao` ou `processar_pagamento`, que são ações sem um "recurso" óbvio. A implicação de escolher REST pra cancelar pedido é que você precisa definir e documentar o ciclo de vida dos estados; no RPC, você só define a função.
+
+---
+
+### Desafio Opcional — Gateway REST→gRPC
+
+**Arquivo criado:** `lab05/desafio/gateway.py`
+
+**Arquitetura implementada:**
+```
+Cliente REST  -->  Gateway Flask (porta 5051)  -->  Servidor gRPC (porta 50051)
+(HTTP/JSON)        (traduz StatusCode -> HTTP)      (HTTP/2 + Protobuf)
+```
+
+**Output dos testes:**
+
+```
+GET /saude            → 200  {"gateway": "online", "grpc_server": "online", "grpc_versao": "1.0.0"}
+POST /calcular soma   → 200  {"resultado": 10.0, "descricao": "7.0 soma 3.0 = 10.0", "via": "gRPC -> HTTP/2 + Protobuf"}
+POST /calcular div    → 200  {"resultado": 3.142857142857143, "descricao": "22.0 divisao 7.0 = 3.142857142857143"}
+Divisao por zero      → 400  {"erro": "Divisao por zero nao e permitida", "grpc_status": "StatusCode.INVALID_ARGUMENT"}
+Operacao invalida     → 400  {"erro": "Operacao desconhecida: 'raiz_quadrada'", "grpc_status": "StatusCode.INVALID_ARGUMENT"}
+Dados invalidos       → 400  {"erro": "Campos 'a' e 'b' devem ser numericos"}
+```
+
+O gateway mapeia todos os `grpc.StatusCode` para HTTP (`INVALID_ARGUMENT→400`, `NOT_FOUND→404`, `UNAVAILABLE→503`, etc.) via dicionário, conforme exigido pelo desafio.
